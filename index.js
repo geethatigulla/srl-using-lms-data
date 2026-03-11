@@ -1,1514 +1,879 @@
 // @ts-self-types="./index.d.ts"
-import * as posixPath from './std__path/posix.js';
-import * as windowsPath from './std__path/windows.js';
-import minimatch from 'minimatch';
-import createDebug from 'debug';
-import { ObjectSchema } from '@eslint/object-schema';
-export { ObjectSchema } from '@eslint/object-schema';
+import levn from 'levn';
 
 /**
- * @fileoverview ConfigSchema
- * @author Nicholas C. Zakas
- */
-
-//------------------------------------------------------------------------------
-// Types
-//------------------------------------------------------------------------------
-
-/** @import * as $eslintobjectschema from "@eslint/object-schema"; */
-/** @typedef {$eslintobjectschema.PropertyDefinition} PropertyDefinition */
-/** @typedef {$eslintobjectschema.ObjectDefinition} ObjectDefinition */
-
-//------------------------------------------------------------------------------
-// Helpers
-//------------------------------------------------------------------------------
-
-/**
- * A strategy that does nothing.
- * @type {PropertyDefinition}
- */
-const NOOP_STRATEGY = {
-	required: false,
-	merge() {
-		return undefined;
-	},
-	validate() {},
-};
-
-//------------------------------------------------------------------------------
-// Exports
-//------------------------------------------------------------------------------
-
-/**
- * The base schema that every ConfigArray uses.
- * @type {ObjectDefinition}
- */
-const baseSchema = Object.freeze({
-	name: {
-		required: false,
-		merge() {
-			return undefined;
-		},
-		validate(value) {
-			if (typeof value !== "string") {
-				throw new TypeError("Property must be a string.");
-			}
-		},
-	},
-	basePath: NOOP_STRATEGY,
-	files: NOOP_STRATEGY,
-	ignores: NOOP_STRATEGY,
-});
-
-/**
- * @fileoverview ConfigSchema
- * @author Nicholas C. Zakas
- */
-
-//------------------------------------------------------------------------------
-// Types
-//------------------------------------------------------------------------------
-
-
-//------------------------------------------------------------------------------
-// Helpers
-//------------------------------------------------------------------------------
-
-/**
- * Asserts that a given value is an array.
- * @param {*} value The value to check.
- * @returns {void}
- * @throws {TypeError} When the value is not an array.
- */
-function assertIsArray(value) {
-	if (!Array.isArray(value)) {
-		throw new TypeError("Expected value to be an array.");
-	}
-}
-
-/**
- * Asserts that a given value is an array containing only strings and functions.
- * @param {*} value The value to check.
- * @returns {void}
- * @throws {TypeError} When the value is not an array of strings and functions.
- */
-function assertIsArrayOfStringsAndFunctions(value) {
-	assertIsArray(value);
-
-	if (
-		value.some(
-			item => typeof item !== "string" && typeof item !== "function",
-		)
-	) {
-		throw new TypeError(
-			"Expected array to only contain strings and functions.",
-		);
-	}
-}
-
-/**
- * Asserts that a given value is a non-empty array.
- * @param {*} value The value to check.
- * @returns {void}
- * @throws {TypeError} When the value is not an array or an empty array.
- */
-function assertIsNonEmptyArray(value) {
-	if (!Array.isArray(value) || value.length === 0) {
-		throw new TypeError("Expected value to be a non-empty array.");
-	}
-}
-
-//------------------------------------------------------------------------------
-// Exports
-//------------------------------------------------------------------------------
-
-/**
- * The schema for `files` and `ignores` that every ConfigArray uses.
- * @type {ObjectDefinition}
- */
-const filesAndIgnoresSchema = Object.freeze({
-	basePath: {
-		required: false,
-		merge() {
-			return undefined;
-		},
-		validate(value) {
-			if (typeof value !== "string") {
-				throw new TypeError("Expected value to be a string.");
-			}
-		},
-	},
-	files: {
-		required: false,
-		merge() {
-			return undefined;
-		},
-		validate(value) {
-			// first check if it's an array
-			assertIsNonEmptyArray(value);
-
-			// then check each member
-			value.forEach(item => {
-				if (Array.isArray(item)) {
-					assertIsArrayOfStringsAndFunctions(item);
-				} else if (
-					typeof item !== "string" &&
-					typeof item !== "function"
-				) {
-					throw new TypeError(
-						"Items must be a string, a function, or an array of strings and functions.",
-					);
-				}
-			});
-		},
-	},
-	ignores: {
-		required: false,
-		merge() {
-			return undefined;
-		},
-		validate: assertIsArrayOfStringsAndFunctions,
-	},
-});
-
-/**
- * @fileoverview ConfigArray
+ * @fileoverview Config Comment Parser
  * @author Nicholas C. Zakas
  */
 
 
-//------------------------------------------------------------------------------
-// Types
-//------------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
+// Type Definitions
+//-----------------------------------------------------------------------------
 
+/** @import * as $eslintcore from "@eslint/core"; */
+/** @typedef {$eslintcore.RuleConfig} RuleConfig */
+/** @typedef {$eslintcore.RulesConfig} RulesConfig */
 /** @import * as $typests from "./types.ts"; */
-/** @typedef {$typests.ConfigObject} ConfigObject */
-/** @import * as $minimatch from "minimatch"; */
-/** @typedef {$minimatch.IMinimatchStatic} IMinimatchStatic */
-/** @typedef {$minimatch.IMinimatch} IMinimatch */
-/** @import * as PathImpl from "@jsr/std__path" */
+/** @typedef {$typests.StringConfig} StringConfig */
+/** @typedef {$typests.BooleanConfig} BooleanConfig */
 
-/*
- * This is a bit of a hack to make TypeScript happy with the Rollup-created
- * CommonJS file. Rollup doesn't do object destructuring for imported files
- * and instead imports the default via `require()`. This messes up type checking
- * for `ObjectSchema`. To work around that, we just import the type manually
- * and give it a different name to use in the JSDoc comments.
- */
-/** @typedef {ObjectSchema} ObjectSchemaInstance */
-
-//------------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
 // Helpers
-//------------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
 
-const Minimatch = minimatch.Minimatch;
-const debug = createDebug("@eslint/config-array");
-
-/**
- * A cache for minimatch instances.
- * @type {Map<string, IMinimatch>}
- */
-const minimatchCache = new Map();
+const directivesPattern = /^([a-z]+(?:-[a-z]+)*)(?:\s|$)/u;
+const validSeverities = new Set([0, 1, 2, "off", "warn", "error"]);
 
 /**
- * A cache for negated minimatch instances.
- * @type {Map<string, IMinimatch>}
+ * Determines if the severity in the rule configuration is valid.
+ * @param {RuleConfig} ruleConfig A rule's configuration.
+ * @returns {boolean} `true` if the severity is valid, otherwise `false`.
  */
-const negatedMinimatchCache = new Map();
+function isSeverityValid(ruleConfig) {
+	const severity = Array.isArray(ruleConfig) ? ruleConfig[0] : ruleConfig;
+	return validSeverities.has(severity);
+}
 
 /**
- * Options to use with minimatch.
- * @type {Object}
+ * Determines if all severities in the rules configuration are valid.
+ * @param {RulesConfig} rulesConfig The rules configuration to check.
+ * @returns {boolean} `true` if all severities are valid, otherwise `false`.
  */
-const MINIMATCH_OPTIONS = {
-	// matchBase: true,
-	dot: true,
-	allowWindowsEscape: true,
-};
+function isEverySeverityValid(rulesConfig) {
+	return Object.values(rulesConfig).every(isSeverityValid);
+}
 
 /**
- * The types of config objects that are supported.
- * @type {Set<string>}
+ * Represents a directive comment.
  */
-const CONFIG_TYPES = new Set(["array", "function"]);
-
-/**
- * Fields that are considered metadata and not part of the config object.
- * @type {Set<string>}
- */
-const META_FIELDS = new Set(["name", "basePath"]);
-
-/**
- * A schema containing just files and ignores for early validation.
- * @type {ObjectSchemaInstance}
- */
-const FILES_AND_IGNORES_SCHEMA = new ObjectSchema(filesAndIgnoresSchema);
-
-// Precomputed constant objects returned by `ConfigArray.getConfigWithStatus`.
-
-const CONFIG_WITH_STATUS_EXTERNAL = Object.freeze({ status: "external" });
-const CONFIG_WITH_STATUS_IGNORED = Object.freeze({ status: "ignored" });
-const CONFIG_WITH_STATUS_UNCONFIGURED = Object.freeze({
-	status: "unconfigured",
-});
-
-// Match two leading dots followed by a slash or the end of input.
-const EXTERNAL_PATH_REGEX = /^\.\.(?:\/|$)/u;
-
-/**
- * Wrapper error for config validation errors that adds a name to the front of the
- * error message.
- */
-class ConfigError extends Error {
+class DirectiveComment {
 	/**
-	 * Creates a new instance.
-	 * @param {string} name The config object name causing the error.
-	 * @param {number} index The index of the config object in the array.
-	 * @param {Object} options The options for the error.
-	 * @param {Error} [options.cause] The error that caused this error.
-	 * @param {string} [options.message] The message to use for the error.
+	 * The label of the directive, such as "eslint", "eslint-disable", etc.
+	 * @type {string}
 	 */
-	constructor(name, index, { cause, message }) {
-		const finalMessage = message || cause.message;
+	label = "";
 
-		super(`Config ${name}: ${finalMessage}`, { cause });
-
-		// copy over custom properties that aren't represented
-		if (cause) {
-			for (const key of Object.keys(cause)) {
-				if (!(key in this)) {
-					this[key] = cause[key];
-				}
-			}
-		}
-
-		/**
-		 * The name of the error.
-		 * @type {string}
-		 * @readonly
-		 */
-		this.name = "ConfigError";
-
-		/**
-		 * The index of the config object in the array.
-		 * @type {number}
-		 * @readonly
-		 */
-		this.index = index;
-	}
-}
-
-/**
- * Gets the name of a config object.
- * @param {ConfigObject} config The config object to get the name of.
- * @returns {string} The name of the config object.
- */
-function getConfigName(config) {
-	if (config && typeof config.name === "string" && config.name) {
-		return `"${config.name}"`;
-	}
-
-	return "(unnamed)";
-}
-
-/**
- * Rethrows a config error with additional information about the config object.
- * @param {object} config The config object to get the name of.
- * @param {number} index The index of the config object in the array.
- * @param {Error} error The error to rethrow.
- * @throws {ConfigError} When the error is rethrown for a config.
- */
-function rethrowConfigError(config, index, error) {
-	const configName = getConfigName(config);
-	throw new ConfigError(configName, index, { cause: error });
-}
-
-/**
- * Shorthand for checking if a value is a string.
- * @param {any} value The value to check.
- * @returns {boolean} True if a string, false if not.
- */
-function isString(value) {
-	return typeof value === "string";
-}
-
-/**
- * Creates a function that asserts that the config is valid
- * during normalization. This checks that the config is not nullish
- * and that files and ignores keys  of a config object are valid as per base schema.
- * @param {Object} config The config object to check.
- * @param {number} index The index of the config object in the array.
- * @returns {void}
- * @throws {ConfigError} If the files and ignores keys of a config object are not valid.
- */
-function assertValidBaseConfig(config, index) {
-	if (config === null) {
-		throw new ConfigError(getConfigName(config), index, {
-			message: "Unexpected null config.",
-		});
-	}
-
-	if (config === undefined) {
-		throw new ConfigError(getConfigName(config), index, {
-			message: "Unexpected undefined config.",
-		});
-	}
-
-	if (typeof config !== "object") {
-		throw new ConfigError(getConfigName(config), index, {
-			message: "Unexpected non-object config.",
-		});
-	}
-
-	const validateConfig = {};
-
-	if ("basePath" in config) {
-		validateConfig.basePath = config.basePath;
-	}
-
-	if ("files" in config) {
-		validateConfig.files = config.files;
-	}
-
-	if ("ignores" in config) {
-		validateConfig.ignores = config.ignores;
-	}
-
-	try {
-		FILES_AND_IGNORES_SCHEMA.validate(validateConfig);
-	} catch (validationError) {
-		rethrowConfigError(config, index, validationError);
-	}
-}
-
-/**
- * Wrapper around minimatch that caches minimatch patterns for
- * faster matching speed over multiple file path evaluations.
- * @param {string} filepath The file path to match.
- * @param {string} pattern The glob pattern to match against.
- * @param {object} options The minimatch options to use.
- * @returns
- */
-function doMatch(filepath, pattern, options = {}) {
-	let cache = minimatchCache;
-
-	if (options.flipNegate) {
-		cache = negatedMinimatchCache;
-	}
-
-	let matcher = cache.get(pattern);
-
-	if (!matcher) {
-		matcher = new Minimatch(
-			pattern,
-			Object.assign({}, MINIMATCH_OPTIONS, options),
-		);
-		cache.set(pattern, matcher);
-	}
-
-	return matcher.match(filepath);
-}
-
-/**
- * Normalizes a pattern by removing the leading "./" if present.
- * @param {string} pattern The pattern to normalize.
- * @returns {string} The normalized pattern.
- */
-function normalizePattern(pattern) {
-	if (isString(pattern)) {
-		if (pattern.startsWith("./")) {
-			return pattern.slice(2);
-		}
-
-		if (pattern.startsWith("!./")) {
-			return `!${pattern.slice(3)}`;
-		}
-	}
-
-	return pattern;
-}
-
-/**
- * Checks if a given pattern requires normalization.
- * @param {any} pattern The pattern to check.
- * @returns {boolean} True if the pattern needs normalization, false otherwise.
- *
- */
-function needsPatternNormalization(pattern) {
-	return (
-		isString(pattern) &&
-		(pattern.startsWith("./") || pattern.startsWith("!./"))
-	);
-}
-
-/**
- * Normalizes `files` and `ignores` patterns in a config by removing "./" prefixes.
- * @param {Object} config The config object to normalize patterns in.
- * @param {string} namespacedBasePath The namespaced base path of the directory to which config base path is relative.
- * @param {PathImpl} path Path-handling implementation.
- * @returns {Object} The normalized config object.
- */
-function normalizeConfigPatterns(config, namespacedBasePath, path) {
-	if (!config) {
-		return config;
-	}
-
-	const hasBasePath = typeof config.basePath === "string";
-
-	let needsNormalization = false;
-
-	if (hasBasePath) {
-		needsNormalization = true;
-	}
-
-	if (!needsNormalization && Array.isArray(config.files)) {
-		needsNormalization = config.files.some(pattern => {
-			if (Array.isArray(pattern)) {
-				return pattern.some(needsPatternNormalization);
-			}
-			return needsPatternNormalization(pattern);
-		});
-	}
-
-	if (!needsNormalization && Array.isArray(config.ignores)) {
-		needsNormalization = config.ignores.some(needsPatternNormalization);
-	}
-
-	if (!needsNormalization) {
-		return config;
-	}
-
-	const newConfig = { ...config };
-
-	if (hasBasePath) {
-		if (path.isAbsolute(config.basePath)) {
-			newConfig.basePath = path.toNamespacedPath(config.basePath);
-		} else {
-			newConfig.basePath = path.resolve(
-				namespacedBasePath,
-				config.basePath,
-			);
-		}
-	}
-
-	if (Array.isArray(newConfig.files)) {
-		newConfig.files = newConfig.files.map(pattern => {
-			if (Array.isArray(pattern)) {
-				return pattern.map(normalizePattern);
-			}
-			return normalizePattern(pattern);
-		});
-	}
-
-	if (Array.isArray(newConfig.ignores)) {
-		newConfig.ignores = newConfig.ignores.map(normalizePattern);
-	}
-
-	return newConfig;
-}
-
-/**
- * Normalizes a `ConfigArray` by flattening it and executing any functions
- * that are found inside.
- * @param {Array} items The items in a `ConfigArray`.
- * @param {Object} context The context object to pass into any function
- *      found.
- * @param {Array<string>} extraConfigTypes The config types to check.
- * @param {string} namespacedBasePath The namespaced base path of the directory to which config base paths are relative.
- * @param {PathImpl} path Path-handling implementation.
- * @returns {Promise<Array>} A flattened array containing only config objects.
- * @throws {TypeError} When a config function returns a function.
- */
-async function normalize(
-	items,
-	context,
-	extraConfigTypes,
-	namespacedBasePath,
-	path,
-) {
-	const allowFunctions = extraConfigTypes.includes("function");
-	const allowArrays = extraConfigTypes.includes("array");
-
-	async function* flatTraverse(array) {
-		for (let item of array) {
-			if (typeof item === "function") {
-				if (!allowFunctions) {
-					throw new TypeError("Unexpected function.");
-				}
-
-				item = item(context);
-				if (item.then) {
-					item = await item;
-				}
-			}
-
-			if (Array.isArray(item)) {
-				if (!allowArrays) {
-					throw new TypeError("Unexpected array.");
-				}
-				yield* flatTraverse(item);
-			} else if (typeof item === "function") {
-				throw new TypeError(
-					"A config function can only return an object or array.",
-				);
-			} else {
-				yield item;
-			}
-		}
-	}
-
-	/*
-	 * Async iterables cannot be used with the spread operator, so we need to manually
-	 * create the array to return.
+	/**
+	 * The value of the directive (the string after the label).
+	 * @type {string}
 	 */
-	const asyncIterable = await flatTraverse(items);
-	const configs = [];
+	value = "";
 
-	for await (const config of asyncIterable) {
-		configs.push(normalizeConfigPatterns(config, namespacedBasePath, path));
-	}
-
-	return configs;
-}
-
-/**
- * Normalizes a `ConfigArray` by flattening it and executing any functions
- * that are found inside.
- * @param {Array} items The items in a `ConfigArray`.
- * @param {Object} context The context object to pass into any function
- *      found.
- * @param {Array<string>} extraConfigTypes The config types to check.
- * @param {string} namespacedBasePath The namespaced base path of the directory to which config base paths are relative.
- * @param {PathImpl} path Path-handling implementation
- * @returns {Array} A flattened array containing only config objects.
- * @throws {TypeError} When a config function returns a function.
- */
-function normalizeSync(
-	items,
-	context,
-	extraConfigTypes,
-	namespacedBasePath,
-	path,
-) {
-	const allowFunctions = extraConfigTypes.includes("function");
-	const allowArrays = extraConfigTypes.includes("array");
-
-	function* flatTraverse(array) {
-		for (let item of array) {
-			if (typeof item === "function") {
-				if (!allowFunctions) {
-					throw new TypeError("Unexpected function.");
-				}
-
-				item = item(context);
-				if (item.then) {
-					throw new TypeError(
-						"Async config functions are not supported.",
-					);
-				}
-			}
-
-			if (Array.isArray(item)) {
-				if (!allowArrays) {
-					throw new TypeError("Unexpected array.");
-				}
-
-				yield* flatTraverse(item);
-			} else if (typeof item === "function") {
-				throw new TypeError(
-					"A config function can only return an object or array.",
-				);
-			} else {
-				yield item;
-			}
-		}
-	}
-
-	const configs = [];
-
-	for (const config of flatTraverse(items)) {
-		configs.push(normalizeConfigPatterns(config, namespacedBasePath, path));
-	}
-
-	return configs;
-}
-
-/**
- * Converts a given path to a relative path with all separator characters replaced by forward slashes (`"/"`).
- * @param {string} fileOrDirPath The unprocessed path to convert.
- * @param {string} namespacedBasePath The namespaced base path of the directory to which the calculated path shall be relative.
- * @param {PathImpl} path Path-handling implementations.
- * @returns {string} A relative path with all separator characters replaced by forward slashes.
- */
-function toRelativePath(fileOrDirPath, namespacedBasePath, path) {
-	const fullPath = path.resolve(namespacedBasePath, fileOrDirPath);
-	const namespacedFullPath = path.toNamespacedPath(fullPath);
-	const relativePath = path.relative(namespacedBasePath, namespacedFullPath);
-	return relativePath.replaceAll(path.SEPARATOR, "/");
-}
-
-/**
- * Determines if a given file path should be ignored based on the given
- * matcher.
- * @param {Array<{ basePath?: string, ignores: Array<string|((string) => boolean)>}>} configs Configuration objects containing `ignores`.
- * @param {string} filePath The unprocessed file path to check.
- * @param {string} relativeFilePath The path of the file to check relative to the base path,
- * 		using forward slash (`"/"`) as a separator.
- * @param {Object} [basePathData] Additional data needed to recalculate paths for configuration objects
- *  	that have `basePath` property.
- * @param {string} [basePathData.basePath] Namespaced path to witch `relativeFilePath` is relative.
- * @param {PathImpl} [basePathData.path] Path-handling implementation.
- * @returns {boolean} True if the path should be ignored and false if not.
- */
-function shouldIgnorePath(
-	configs,
-	filePath,
-	relativeFilePath,
-	{ basePath, path } = {},
-) {
-	let shouldIgnore = false;
-
-	for (const config of configs) {
-		let relativeFilePathToCheck = relativeFilePath;
-		if (config.basePath) {
-			relativeFilePathToCheck = toRelativePath(
-				path.resolve(basePath, relativeFilePath),
-				config.basePath,
-				path,
-			);
-
-			if (
-				relativeFilePathToCheck === "" ||
-				EXTERNAL_PATH_REGEX.test(relativeFilePathToCheck)
-			) {
-				continue;
-			}
-
-			if (relativeFilePath.endsWith("/")) {
-				relativeFilePathToCheck += "/";
-			}
-		}
-		shouldIgnore = config.ignores.reduce((ignored, matcher) => {
-			if (!ignored) {
-				if (typeof matcher === "function") {
-					return matcher(filePath);
-				}
-
-				// don't check negated patterns because we're not ignored yet
-				if (!matcher.startsWith("!")) {
-					return doMatch(relativeFilePathToCheck, matcher);
-				}
-
-				// otherwise we're still not ignored
-				return false;
-			}
-
-			// only need to check negated patterns because we're ignored
-			if (typeof matcher === "string" && matcher.startsWith("!")) {
-				return !doMatch(relativeFilePathToCheck, matcher, {
-					flipNegate: true,
-				});
-			}
-
-			return ignored;
-		}, shouldIgnore);
-	}
-
-	return shouldIgnore;
-}
-
-/**
- * Determines if a given file path is matched by a config. If the config
- * has no `files` field, then it matches; otherwise, if a `files` field
- * is present then we match the globs in `files` and exclude any globs in
- * `ignores`.
- * @param {string} filePath The unprocessed file path to check.
- * @param {string} relativeFilePath The path of the file to check relative to the base path,
- * 		using forward slash (`"/"`) as a separator.
- * @param {Object} config The config object to check.
- * @returns {boolean} True if the file path is matched by the config,
- *      false if not.
- */
-function pathMatches(filePath, relativeFilePath, config) {
-	// match both strings and functions
-	function match(pattern) {
-		if (isString(pattern)) {
-			return doMatch(relativeFilePath, pattern);
-		}
-
-		if (typeof pattern === "function") {
-			return pattern(filePath);
-		}
-
-		throw new TypeError(`Unexpected matcher type ${pattern}.`);
-	}
-
-	// check for all matches to config.files
-	let filePathMatchesPattern = config.files.some(pattern => {
-		if (Array.isArray(pattern)) {
-			return pattern.every(match);
-		}
-
-		return match(pattern);
-	});
-
-	/*
-	 * If the file path matches the config.files patterns, then check to see
-	 * if there are any files to ignore.
+	/**
+	 * The justification of the directive (the string after the --).
+	 * @type {string}
 	 */
-	if (filePathMatchesPattern && config.ignores) {
-		/*
-		 * Pass config object without `basePath`, because `relativeFilePath` is already
-		 * calculated as relative to it.
-		 */
-		filePathMatchesPattern = !shouldIgnorePath(
-			[{ ignores: config.ignores }],
-			filePath,
-			relativeFilePath,
-		);
+	justification = "";
+
+	/**
+	 * Creates a new directive comment.
+	 * @param {string} label The label of the directive.
+	 * @param {string} value The value of the directive.
+	 * @param {string} justification The justification of the directive.
+	 */
+	constructor(label, value, justification) {
+		this.label = label;
+		this.value = value;
+		this.justification = justification;
 	}
-
-	return filePathMatchesPattern;
-}
-
-/**
- * Ensures that a ConfigArray has been normalized.
- * @param {ConfigArray} configArray The ConfigArray to check.
- * @returns {void}
- * @throws {Error} When the `ConfigArray` is not normalized.
- */
-function assertNormalized(configArray) {
-	// TODO: Throw more verbose error
-	if (!configArray.isNormalized()) {
-		throw new Error(
-			"ConfigArray must be normalized to perform this operation.",
-		);
-	}
-}
-
-/**
- * Ensures that config types are valid.
- * @param {Array<string>} extraConfigTypes The config types to check.
- * @returns {void}
- * @throws {TypeError} When the config types array is invalid.
- */
-function assertExtraConfigTypes(extraConfigTypes) {
-	if (extraConfigTypes.length > 2) {
-		throw new TypeError(
-			"configTypes must be an array with at most two items.",
-		);
-	}
-
-	for (const configType of extraConfigTypes) {
-		if (!CONFIG_TYPES.has(configType)) {
-			throw new TypeError(
-				`Unexpected config type "${configType}" found. Expected one of: "object", "array", "function".`,
-			);
-		}
-	}
-}
-
-/**
- * Returns path-handling implementations for Unix or Windows, depending on a given absolute path.
- * @param {string} fileOrDirPath The absolute path to check.
- * @returns {PathImpl} Path-handling implementations for the specified path.
- * @throws {Error} An error is thrown if the specified argument is not an absolute path.
- */
-function getPathImpl(fileOrDirPath) {
-	// Posix absolute paths always start with a slash.
-	if (fileOrDirPath.startsWith("/")) {
-		return posixPath;
-	}
-
-	// Windows absolute paths start with a letter followed by a colon and at least one backslash,
-	// or with two backslashes in the case of UNC paths.
-	// Forward slashed are automatically normalized to backslashes.
-	if (/^(?:[A-Za-z]:[/\\]|[/\\]{2})/u.test(fileOrDirPath)) {
-		return windowsPath;
-	}
-
-	throw new Error(
-		`Expected an absolute path but received "${fileOrDirPath}"`,
-	);
 }
 
 //------------------------------------------------------------------------------
 // Public Interface
 //------------------------------------------------------------------------------
 
-const ConfigArraySymbol = {
-	isNormalized: Symbol("isNormalized"),
-	configCache: Symbol("configCache"),
-	schema: Symbol("schema"),
-	finalizeConfig: Symbol("finalizeConfig"),
-	preprocessConfig: Symbol("preprocessConfig"),
-};
-
-// used to store calculate data for faster lookup
-const dataCache = new WeakMap();
-
 /**
- * Represents an array of config objects and provides method for working with
- * those config objects.
+ * Object to parse ESLint configuration comments.
  */
-class ConfigArray extends Array {
+class ConfigCommentParser {
 	/**
-	 * The namespaced path of the config file directory.
-	 * @type {string}
+	 * Parses a list of "name:string_value" or/and "name" options divided by comma or
+	 * whitespace. Used for "global" comments.
+	 * @param {string} string The string to parse.
+	 * @returns {StringConfig} Result map object of names and string values, or null values if no value was provided.
 	 */
-	#namespacedBasePath;
+	parseStringConfig(string) {
+		const items = /** @type {StringConfig} */ ({});
 
-	/**
-	 * Path-handling implementations.
-	 * @type {PathImpl}
-	 */
-	#path;
+		// Collapse whitespace around `:` and `,` to make parsing easier
+		const trimmedString = string
+			.trim()
+			.replace(/(?<!\s)\s*([:,])\s*/gu, "$1");
 
-	/**
-	 * Creates a new instance of ConfigArray.
-	 * @param {Iterable|Function|Object} configs An iterable yielding config
-	 *      objects, or a config function, or a config object.
-	 * @param {Object} options The options for the ConfigArray.
-	 * @param {string} [options.basePath="/"] The absolute path of the config file directory.
-	 * 		Defaults to `"/"`.
-	 * @param {boolean} [options.normalized=false] Flag indicating if the
-	 *      configs have already been normalized.
-	 * @param {Object} [options.schema] The additional schema
-	 *      definitions to use for the ConfigArray schema.
-	 * @param {Array<string>} [options.extraConfigTypes] List of config types supported.
-	 * @throws {TypeError} When the `basePath` is not a non-empty string,
-	 */
-	constructor(
-		configs,
-		{
-			basePath = "/",
-			normalized = false,
-			schema: customSchema,
-			extraConfigTypes = [],
-		} = {},
-	) {
-		super();
+		trimmedString.split(/\s|,+/u).forEach(name => {
+			if (!name) {
+				return;
+			}
 
-		/**
-		 * Tracks if the array has been normalized.
-		 * @property isNormalized
-		 * @type {boolean}
-		 * @private
-		 */
-		this[ConfigArraySymbol.isNormalized] = normalized;
+			// value defaults to null (if not provided), e.g: "foo" => ["foo", null]
+			const [key, value = null] = name.split(":");
 
-		/**
-		 * The schema used for validating and merging configs.
-		 * @property schema
-		 * @type {ObjectSchemaInstance}
-		 * @private
-		 */
-		this[ConfigArraySymbol.schema] = new ObjectSchema(
-			Object.assign({}, customSchema, baseSchema),
-		);
-
-		if (!isString(basePath) || !basePath) {
-			throw new TypeError("basePath must be a non-empty string");
-		}
-
-		/**
-		 * The path of the config file that this array was loaded from.
-		 * This is used to calculate filename matches.
-		 * @property basePath
-		 * @type {string}
-		 */
-		this.basePath = basePath;
-
-		assertExtraConfigTypes(extraConfigTypes);
-
-		/**
-		 * The supported config types.
-		 * @type {Array<string>}
-		 */
-		this.extraConfigTypes = [...extraConfigTypes];
-		Object.freeze(this.extraConfigTypes);
-
-		/**
-		 * A cache to store calculated configs for faster repeat lookup.
-		 * @property configCache
-		 * @type {Map<string, Object>}
-		 * @private
-		 */
-		this[ConfigArraySymbol.configCache] = new Map();
-
-		// init cache
-		dataCache.set(this, {
-			explicitMatches: new Map(),
-			directoryMatches: new Map(),
-			files: undefined,
-			ignores: undefined,
+			items[key] = value;
 		});
 
-		// load the configs into this array
-		if (Array.isArray(configs)) {
-			this.push(...configs);
-		} else {
-			this.push(configs);
-		}
-
-		// select path-handling implementations depending on the base path
-		this.#path = getPathImpl(basePath);
-
-		// On Windows, `path.relative()` returns an absolute path when given two paths on different drives.
-		// The namespaced base path is useful to make sure that calculated relative paths are always relative.
-		// On Unix, it is identical to the base path.
-		this.#namespacedBasePath = this.#path.toNamespacedPath(basePath);
+		return items;
 	}
 
 	/**
-	 * Prevent normal array methods from creating a new `ConfigArray` instance.
-	 * This is to ensure that methods such as `slice()` won't try to create a
-	 * new instance of `ConfigArray` behind the scenes as doing so may throw
-	 * an error due to the different constructor signature.
-	 * @type {ArrayConstructor} The `Array` constructor.
+	 * Parses a JSON-like config.
+	 * @param {string} string The string to parse.
+	 * @returns {({ok: true, config: RulesConfig}|{ok: false, error: {message: string}})} Result map object
 	 */
-	static get [Symbol.species]() {
-		return Array;
-	}
-
-	/**
-	 * Returns the `files` globs from every config object in the array.
-	 * This can be used to determine which files will be matched by a
-	 * config array or to use as a glob pattern when no patterns are provided
-	 * for a command line interface.
-	 * @returns {Array<string|Function>} An array of matchers.
-	 */
-	get files() {
-		assertNormalized(this);
-
-		// if this data has been cached, retrieve it
-		const cache = dataCache.get(this);
-
-		if (cache.files) {
-			return cache.files;
-		}
-
-		// otherwise calculate it
-
-		const result = [];
-
-		for (const config of this) {
-			if (config.files) {
-				config.files.forEach(filePattern => {
-					result.push(filePattern);
-				});
-			}
-		}
-
-		// store result
-		cache.files = result;
-		dataCache.set(this, cache);
-
-		return result;
-	}
-
-	/**
-	 * Returns ignore matchers that should always be ignored regardless of
-	 * the matching `files` fields in any configs. This is necessary to mimic
-	 * the behavior of things like .gitignore and .eslintignore, allowing a
-	 * globbing operation to be faster.
-	 * @returns {Object[]} An array of config objects representing global ignores.
-	 */
-	get ignores() {
-		assertNormalized(this);
-
-		// if this data has been cached, retrieve it
-		const cache = dataCache.get(this);
-
-		if (cache.ignores) {
-			return cache.ignores;
-		}
-
-		// otherwise calculate it
-
-		const result = [];
-
-		for (const config of this) {
-			/*
-			 * We only count ignores if there are no other keys in the object.
-			 * In this case, it acts list a globally ignored pattern. If there
-			 * are additional keys, then ignores act like exclusions.
-			 */
-			if (
-				config.ignores &&
-				Object.keys(config).filter(key => !META_FIELDS.has(key))
-					.length === 1
-			) {
-				result.push(config);
-			}
-		}
-
-		// store result
-		cache.ignores = result;
-		dataCache.set(this, cache);
-
-		return result;
-	}
-
-	/**
-	 * Indicates if the config array has been normalized.
-	 * @returns {boolean} True if the config array is normalized, false if not.
-	 */
-	isNormalized() {
-		return this[ConfigArraySymbol.isNormalized];
-	}
-
-	/**
-	 * Normalizes a config array by flattening embedded arrays and executing
-	 * config functions.
-	 * @param {Object} [context] The context object for config functions.
-	 * @returns {Promise<ConfigArray>} The current ConfigArray instance.
-	 */
-	async normalize(context = {}) {
-		if (!this.isNormalized()) {
-			const normalizedConfigs = await normalize(
-				this,
-				context,
-				this.extraConfigTypes,
-				this.#namespacedBasePath,
-				this.#path,
-			);
-			this.length = 0;
-			this.push(
-				...normalizedConfigs.map(
-					this[ConfigArraySymbol.preprocessConfig].bind(this),
-				),
-			);
-			this.forEach(assertValidBaseConfig);
-			this[ConfigArraySymbol.isNormalized] = true;
-
-			// prevent further changes
-			Object.freeze(this);
-		}
-
-		return this;
-	}
-
-	/**
-	 * Normalizes a config array by flattening embedded arrays and executing
-	 * config functions.
-	 * @param {Object} [context] The context object for config functions.
-	 * @returns {ConfigArray} The current ConfigArray instance.
-	 */
-	normalizeSync(context = {}) {
-		if (!this.isNormalized()) {
-			const normalizedConfigs = normalizeSync(
-				this,
-				context,
-				this.extraConfigTypes,
-				this.#namespacedBasePath,
-				this.#path,
-			);
-			this.length = 0;
-			this.push(
-				...normalizedConfigs.map(
-					this[ConfigArraySymbol.preprocessConfig].bind(this),
-				),
-			);
-			this.forEach(assertValidBaseConfig);
-			this[ConfigArraySymbol.isNormalized] = true;
-
-			// prevent further changes
-			Object.freeze(this);
-		}
-
-		return this;
-	}
-
-	/* eslint-disable class-methods-use-this -- Desired as instance methods */
-
-	/**
-	 * Finalizes the state of a config before being cached and returned by
-	 * `getConfig()`. Does nothing by default but is provided to be
-	 * overridden by subclasses as necessary.
-	 * @param {Object} config The config to finalize.
-	 * @returns {Object} The finalized config.
-	 */
-	// Cast key to `never` to prevent TypeScript from adding the signature `[x: symbol]: (config: any) => any` to the type of the class.
-	[/** @type {never} */ (ConfigArraySymbol.finalizeConfig)](config) {
-		return config;
-	}
-
-	/**
-	 * Preprocesses a config during the normalization process. This is the
-	 * method to override if you want to convert an array item before it is
-	 * validated for the first time. For example, if you want to replace a
-	 * string with an object, this is the method to override.
-	 * @param {Object} config The config to preprocess.
-	 * @returns {Object} The config to use in place of the argument.
-	 */
-	// Cast key to `never` to prevent TypeScript from adding the signature `[x: symbol]: (config: any) => any` to the type of the class.
-	[/** @type {never} */ (ConfigArraySymbol.preprocessConfig)](config) {
-		return config;
-	}
-
-	/* eslint-enable class-methods-use-this -- Desired as instance methods */
-
-	/**
-	 * Returns the config object for a given file path and a status that can be used to determine why a file has no config.
-	 * @param {string} filePath The path of a file to get a config for.
-	 * @returns {{ config?: Object, status: "ignored"|"external"|"unconfigured"|"matched" }}
-	 * An object with an optional property `config` and property `status`.
-	 * `config` is the config object for the specified file as returned by {@linkcode ConfigArray.getConfig},
-	 * `status` a is one of the constants returned by {@linkcode ConfigArray.getConfigStatus}.
-	 */
-	getConfigWithStatus(filePath) {
-		assertNormalized(this);
-
-		const cache = this[ConfigArraySymbol.configCache];
-
-		// first check the cache for a filename match to avoid duplicate work
-		if (cache.has(filePath)) {
-			return cache.get(filePath);
-		}
-
-		// check to see if the file is outside the base path
-
-		const relativeToBaseFilePath = toRelativePath(
-			filePath,
-			this.#namespacedBasePath,
-			this.#path,
-		);
-
-		if (EXTERNAL_PATH_REGEX.test(relativeToBaseFilePath)) {
-			debug(`No config for file ${filePath} outside of base path`);
-
-			// cache and return result
-			cache.set(filePath, CONFIG_WITH_STATUS_EXTERNAL);
-			return CONFIG_WITH_STATUS_EXTERNAL;
-		}
-
-		// next check to see if the file should be ignored
-
-		// check if this should be ignored due to its directory
-		if (this.isDirectoryIgnored(this.#path.dirname(filePath))) {
-			debug(`Ignoring ${filePath} based on directory pattern`);
-
-			// cache and return result
-			cache.set(filePath, CONFIG_WITH_STATUS_IGNORED);
-			return CONFIG_WITH_STATUS_IGNORED;
-		}
-
-		if (
-			shouldIgnorePath(this.ignores, filePath, relativeToBaseFilePath, {
-				basePath: this.#namespacedBasePath,
-				path: this.#path,
-			})
-		) {
-			debug(`Ignoring ${filePath} based on file pattern`);
-
-			// cache and return result
-			cache.set(filePath, CONFIG_WITH_STATUS_IGNORED);
-			return CONFIG_WITH_STATUS_IGNORED;
-		}
-
-		// filePath isn't automatically ignored, so try to construct config
-
-		const matchingConfigIndices = [];
-		let matchFound = false;
-		const universalPattern = /^\*$|^!|\/\*{1,2}$/u;
-
-		this.forEach((config, index) => {
-			const relativeFilePath = config.basePath
-				? toRelativePath(
-						this.#path.resolve(this.#namespacedBasePath, filePath),
-						config.basePath,
-						this.#path,
-					)
-				: relativeToBaseFilePath;
-
-			if (config.basePath && EXTERNAL_PATH_REGEX.test(relativeFilePath)) {
-				debug(
-					`Skipped config found for ${filePath} (based on config's base path: ${config.basePath}`,
-				);
-				return;
-			}
-
-			if (!config.files) {
-				if (!config.ignores) {
-					debug(`Universal config found for ${filePath}`);
-					matchingConfigIndices.push(index);
-					return;
-				}
-
-				if (
-					Object.keys(config).filter(key => !META_FIELDS.has(key))
-						.length === 1
-				) {
-					debug(
-						`Skipped config found for ${filePath} (global ignores)`,
-					);
-					return;
-				}
-
-				/*
-				 * Pass config object without `basePath`, because `relativeFilePath` is already
-				 * calculated as relative to it.
-				 */
-				if (
-					shouldIgnorePath(
-						[{ ignores: config.ignores }],
-						filePath,
-						relativeFilePath,
-					)
-				) {
-					debug(
-						`Skipped config found for ${filePath} (based on ignores: ${config.ignores})`,
-					);
-					return;
-				}
-
-				debug(
-					`Matching config found for ${filePath} (based on ignores: ${config.ignores})`,
-				);
-				matchingConfigIndices.push(index);
-				return;
-			}
+	parseJSONLikeConfig(string) {
+		// Parses a JSON-like comment by the same way as parsing CLI option.
+		try {
+			const items =
+				/** @type {RulesConfig} */ (levn.parse("Object", string)) || {};
 
 			/*
-			 * If a config has a files pattern * or patterns ending in /** or /*,
-			 * and the filePath only matches those patterns, then the config is only
-			 * applied if there is another config where the filePath matches
-			 * a file with a specific extensions such as *.js.
+			 * When the configuration has any invalid severities, it should be completely
+			 * ignored. This is because the configuration is not valid and should not be
+			 * applied.
+			 *
+			 * For example, the following configuration is invalid:
+			 *
+			 *    "no-alert: 2 no-console: 2"
+			 *
+			 * This results in a configuration of { "no-alert": "2 no-console: 2" }, which is
+			 * not valid. In this case, the configuration should be ignored.
 			 */
-
-			const nonUniversalFiles = [];
-			const universalFiles = config.files.filter(element => {
-				if (Array.isArray(element)) {
-					/*
-					 * filePath matches an element that is an array only if it matches
-					 * all patterns in it (AND operation). Therefore, if there is at least
-					 * one non-universal pattern in the array, and filePath matches the array,
-					 * then we know for sure that filePath matches at least one non-universal
-					 * pattern, so we can consider the entire array to be non-universal.
-					 * In other words, all patterns in the array need to be universal
-					 * for it to be considered universal.
-					 */
-					if (
-						element.every(pattern => universalPattern.test(pattern))
-					) {
-						return true;
-					}
-
-					nonUniversalFiles.push(element);
-					return false;
-				}
-
-				// element is a string
-
-				if (universalPattern.test(element)) {
-					return true;
-				}
-
-				nonUniversalFiles.push(element);
-				return false;
-			});
-
-			// universal patterns were found so we need to check the config twice
-			if (universalFiles.length) {
-				debug("Universal files patterns found. Checking carefully.");
-
-				// check that the config matches without the non-universal files first
-				if (
-					nonUniversalFiles.length &&
-					pathMatches(filePath, relativeFilePath, {
-						files: nonUniversalFiles,
-						ignores: config.ignores,
-					})
-				) {
-					debug(`Matching config found for ${filePath}`);
-					matchingConfigIndices.push(index);
-					matchFound = true;
-					return;
-				}
-
-				// if there wasn't a match then check if it matches with universal files
-				if (
-					universalFiles.length &&
-					pathMatches(filePath, relativeFilePath, {
-						files: universalFiles,
-						ignores: config.ignores,
-					})
-				) {
-					debug(`Matching config found for ${filePath}`);
-					matchingConfigIndices.push(index);
-					return;
-				}
-
-				// if we make here, then there was no match
-				return;
+			if (isEverySeverityValid(items)) {
+				return {
+					ok: true,
+					config: items,
+				};
 			}
-
-			// the normal case
-			if (pathMatches(filePath, relativeFilePath, config)) {
-				debug(`Matching config found for ${filePath}`);
-				matchingConfigIndices.push(index);
-				matchFound = true;
-			}
-		});
-
-		// if matching both files and ignores, there will be no config to create
-		if (!matchFound) {
-			debug(`No matching configs found for ${filePath}`);
-
-			// cache and return result
-			cache.set(filePath, CONFIG_WITH_STATUS_UNCONFIGURED);
-			return CONFIG_WITH_STATUS_UNCONFIGURED;
+		} catch {
+			// levn parsing error: ignore to parse the string by a fallback.
 		}
-
-		// check to see if there is a config cached by indices
-		const indicesKey = matchingConfigIndices.toString();
-		let configWithStatus = cache.get(indicesKey);
-
-		if (configWithStatus) {
-			// also store for filename for faster lookup next time
-			cache.set(filePath, configWithStatus);
-
-			return configWithStatus;
-		}
-
-		// otherwise construct the config
-
-		// eslint-disable-next-line array-callback-return, consistent-return -- rethrowConfigError always throws an error
-		let finalConfig = matchingConfigIndices.reduce((result, index) => {
-			try {
-				return this[ConfigArraySymbol.schema].merge(
-					result,
-					this[index],
-				);
-			} catch (validationError) {
-				rethrowConfigError(this[index], index, validationError);
-			}
-		}, {});
-
-		finalConfig = this[ConfigArraySymbol.finalizeConfig](finalConfig);
-
-		configWithStatus = Object.freeze({
-			config: finalConfig,
-			status: "matched",
-		});
-		cache.set(filePath, configWithStatus);
-		cache.set(indicesKey, configWithStatus);
-
-		return configWithStatus;
-	}
-
-	/**
-	 * Returns the config object for a given file path.
-	 * @param {string} filePath The path of a file to get a config for.
-	 * @returns {Object|undefined} The config object for this file or `undefined`.
-	 */
-	getConfig(filePath) {
-		return this.getConfigWithStatus(filePath).config;
-	}
-
-	/**
-	 * Determines whether a file has a config or why it doesn't.
-	 * @param {string} filePath The path of the file to check.
-	 * @returns {"ignored"|"external"|"unconfigured"|"matched"} One of the following values:
-	 * * `"ignored"`: the file is ignored
-	 * * `"external"`: the file is outside the base path
-	 * * `"unconfigured"`: the file is not matched by any config
-	 * * `"matched"`: the file has a matching config
-	 */
-	getConfigStatus(filePath) {
-		return this.getConfigWithStatus(filePath).status;
-	}
-
-	/**
-	 * Determines if the given filepath is ignored based on the configs.
-	 * @param {string} filePath The path of a file to check.
-	 * @returns {boolean} True if the path is ignored, false if not.
-	 * @deprecated Use `isFileIgnored` instead.
-	 */
-	isIgnored(filePath) {
-		return this.isFileIgnored(filePath);
-	}
-
-	/**
-	 * Determines if the given filepath is ignored based on the configs.
-	 * @param {string} filePath The path of a file to check.
-	 * @returns {boolean} True if the path is ignored, false if not.
-	 */
-	isFileIgnored(filePath) {
-		return this.getConfigStatus(filePath) === "ignored";
-	}
-
-	/**
-	 * Determines if the given directory is ignored based on the configs.
-	 * This checks only default `ignores` that don't have `files` in the
-	 * same config. A pattern such as `/foo` be considered to ignore the directory
-	 * while a pattern such as `/foo/**` is not considered to ignore the
-	 * directory because it is matching files.
-	 * @param {string} directoryPath The path of a directory to check.
-	 * @returns {boolean} True if the directory is ignored, false if not. Will
-	 * 		return true for any directory that is not inside of `basePath`.
-	 * @throws {Error} When the `ConfigArray` is not normalized.
-	 */
-	isDirectoryIgnored(directoryPath) {
-		assertNormalized(this);
-
-		const relativeDirectoryPath = toRelativePath(
-			directoryPath,
-			this.#namespacedBasePath,
-			this.#path,
-		);
-
-		// basePath directory can never be ignored
-		if (relativeDirectoryPath === "") {
-			return false;
-		}
-
-		if (EXTERNAL_PATH_REGEX.test(relativeDirectoryPath)) {
-			return true;
-		}
-
-		// first check the cache
-		const cache = dataCache.get(this).directoryMatches;
-
-		if (cache.has(relativeDirectoryPath)) {
-			return cache.get(relativeDirectoryPath);
-		}
-
-		const directoryParts = relativeDirectoryPath.split("/");
-		let relativeDirectoryToCheck = "";
-		let result;
 
 		/*
-		 * In order to get the correct gitignore-style ignores, where an
-		 * ignored parent directory cannot have any descendants unignored,
-		 * we need to check every directory starting at the parent all
-		 * the way down to the actual requested directory.
-		 *
-		 * We aggressively cache all of this info to make sure we don't
-		 * have to recalculate everything for every call.
+		 * Optionator cannot parse commaless notations.
+		 * But we are supporting that. So this is a fallback for that.
 		 */
-		do {
-			relativeDirectoryToCheck += `${directoryParts.shift()}/`;
+		const normalizedString = string
+			.replace(/(?<![-a-zA-Z0-9/])([-a-zA-Z0-9/]+):/gu, '"$1":')
+			.replace(/([\]0-9])\s+(?=")/u, "$1,");
 
-			result = shouldIgnorePath(
-				this.ignores,
-				this.#path.join(this.basePath, relativeDirectoryToCheck),
-				relativeDirectoryToCheck,
-				{
-					basePath: this.#namespacedBasePath,
-					path: this.#path,
+		try {
+			const items = JSON.parse(`{${normalizedString}}`);
+
+			return {
+				ok: true,
+				config: items,
+			};
+		} catch (ex) {
+			const errorMessage = ex instanceof Error ? ex.message : String(ex);
+
+			return {
+				ok: false,
+				error: {
+					message: `Failed to parse JSON from '${normalizedString}': ${errorMessage}`,
 				},
-			);
+			};
+		}
+	}
 
-			cache.set(relativeDirectoryToCheck, result);
-		} while (!result && directoryParts.length);
+	/**
+	 * Parses a config of values separated by comma.
+	 * @param {string} string The string to parse.
+	 * @returns {BooleanConfig} Result map of values and true values
+	 */
+	parseListConfig(string) {
+		const items = /** @type {BooleanConfig} */ ({});
 
-		// also cache the result for the requested path
-		cache.set(relativeDirectoryPath, result);
+		string.split(",").forEach(name => {
+			const trimmedName = name
+				.trim()
+				.replace(
+					/^(?<quote>['"]?)(?<ruleId>.*)\k<quote>$/su,
+					"$<ruleId>",
+				);
 
-		return result;
+			if (trimmedName) {
+				items[trimmedName] = true;
+			}
+		});
+
+		return items;
+	}
+
+	/**
+	 * Extract the directive and the justification from a given directive comment and trim them.
+	 * @param {string} value The comment text to extract.
+	 * @returns {{directivePart: string, justificationPart: string}} The extracted directive and justification.
+	 */
+	#extractDirectiveComment(value) {
+		const match = /\s-{2,}\s/u.exec(value);
+
+		if (!match) {
+			return { directivePart: value.trim(), justificationPart: "" };
+		}
+
+		const directive = value.slice(0, match.index).trim();
+		const justification = value.slice(match.index + match[0].length).trim();
+
+		return { directivePart: directive, justificationPart: justification };
+	}
+
+	/**
+	 * Parses a directive comment into directive text and value.
+	 * @param {string} string The string with the directive to be parsed.
+	 * @returns {DirectiveComment|undefined} The parsed directive or `undefined` if the directive is invalid.
+	 */
+	parseDirective(string) {
+		const { directivePart, justificationPart } =
+			this.#extractDirectiveComment(string);
+		const match = directivesPattern.exec(directivePart);
+
+		if (!match) {
+			return undefined;
+		}
+
+		const directiveText = match[1];
+		const directiveValue = directivePart.slice(
+			match.index + directiveText.length,
+		);
+
+		return new DirectiveComment(
+			directiveText,
+			directiveValue.trim(),
+			justificationPart,
+		);
 	}
 }
 
-export { ConfigArray, ConfigArraySymbol };
+/**
+ * @fileoverview A collection of helper classes for implementing `SourceCode`.
+ * @author Nicholas C. Zakas
+ */
+
+/* eslint class-methods-use-this: off -- Required to complete interface. */
+
+//-----------------------------------------------------------------------------
+// Type Definitions
+//-----------------------------------------------------------------------------
+
+/** @typedef {$eslintcore.VisitTraversalStep} VisitTraversalStep */
+/** @typedef {$eslintcore.CallTraversalStep} CallTraversalStep */
+/** @typedef {$eslintcore.TraversalStep} TraversalStep */
+/** @typedef {$eslintcore.SourceLocation} SourceLocation */
+/** @typedef {$eslintcore.SourceLocationWithOffset} SourceLocationWithOffset */
+/** @typedef {$eslintcore.SourceRange} SourceRange */
+/** @typedef {$eslintcore.Directive} IDirective */
+/** @typedef {$eslintcore.DirectiveType} DirectiveType */
+/** @typedef {$eslintcore.SourceCodeBaseTypeOptions} SourceCodeBaseTypeOptions */
+/**
+ * @typedef {import("@eslint/core").TextSourceCode<Options>} TextSourceCode<Options>
+ * @template {SourceCodeBaseTypeOptions} [Options=SourceCodeBaseTypeOptions]
+ */
+
+//-----------------------------------------------------------------------------
+// Helpers
+//-----------------------------------------------------------------------------
+
+/**
+ * Determines if a node has ESTree-style loc information.
+ * @param {object} node The node to check.
+ * @returns {node is {loc:SourceLocation}} `true` if the node has ESTree-style loc information, `false` if not.
+ */
+function hasESTreeStyleLoc(node) {
+	return "loc" in node;
+}
+
+/**
+ * Determines if a node has position-style loc information.
+ * @param {object} node The node to check.
+ * @returns {node is {position:SourceLocation}} `true` if the node has position-style range information, `false` if not.
+ */
+function hasPosStyleLoc(node) {
+	return "position" in node;
+}
+
+/**
+ * Determines if a node has ESTree-style range information.
+ * @param {object} node The node to check.
+ * @returns {node is {range:SourceRange}} `true` if the node has ESTree-style range information, `false` if not.
+ */
+function hasESTreeStyleRange(node) {
+	return "range" in node;
+}
+
+/**
+ * Determines if a node has position-style range information.
+ * @param {object} node The node to check.
+ * @returns {node is {position:SourceLocationWithOffset}} `true` if the node has position-style range information, `false` if not.
+ */
+function hasPosStyleRange(node) {
+	return "position" in node;
+}
+
+/**
+ * Performs binary search to find the line number containing a given target index.
+ * Returns the lower bound - the index of the first element greater than the target.
+ * **Please note that the `lineStartIndices` should be sorted in ascending order**.
+ * - Time Complexity: O(log n) - Significantly faster than linear search for large files.
+ * @param {number[]} lineStartIndices Sorted array of line start indices.
+ * @param {number} targetIndex The target index to find the line number for.
+ * @returns {number} The line number for the target index.
+ */
+function findLineNumberBinarySearch(lineStartIndices, targetIndex) {
+	let low = 0;
+	let high = lineStartIndices.length - 1;
+
+	while (low < high) {
+		const mid = ((low + high) / 2) | 0; // Use bitwise OR to floor the division.
+
+		if (targetIndex < lineStartIndices[mid]) {
+			high = mid;
+		} else {
+			low = mid + 1;
+		}
+	}
+
+	return low;
+}
+
+//-----------------------------------------------------------------------------
+// Exports
+//-----------------------------------------------------------------------------
+
+/**
+ * A class to represent a step in the traversal process where a node is visited.
+ * @implements {VisitTraversalStep}
+ */
+class VisitNodeStep {
+	/**
+	 * The type of the step.
+	 * @type {"visit"}
+	 * @readonly
+	 */
+	type = "visit";
+
+	/**
+	 * The kind of the step. Represents the same data as the `type` property
+	 * but it's a number for performance.
+	 * @type {1}
+	 * @readonly
+	 */
+	kind = 1;
+
+	/**
+	 * The target of the step.
+	 * @type {object}
+	 */
+	target;
+
+	/**
+	 * The phase of the step.
+	 * @type {1|2}
+	 */
+	phase;
+
+	/**
+	 * The arguments of the step.
+	 * @type {Array<any>}
+	 */
+	args;
+
+	/**
+	 * Creates a new instance.
+	 * @param {Object} options The options for the step.
+	 * @param {object} options.target The target of the step.
+	 * @param {1|2} options.phase The phase of the step.
+	 * @param {Array<any>} options.args The arguments of the step.
+	 */
+	constructor({ target, phase, args }) {
+		this.target = target;
+		this.phase = phase;
+		this.args = args;
+	}
+}
+
+/**
+ * A class to represent a step in the traversal process where a
+ * method is called.
+ * @implements {CallTraversalStep}
+ */
+class CallMethodStep {
+	/**
+	 * The type of the step.
+	 * @type {"call"}
+	 * @readonly
+	 */
+	type = "call";
+
+	/**
+	 * The kind of the step. Represents the same data as the `type` property
+	 * but it's a number for performance.
+	 * @type {2}
+	 * @readonly
+	 */
+	kind = 2;
+
+	/**
+	 * The name of the method to call.
+	 * @type {string}
+	 */
+	target;
+
+	/**
+	 * The arguments to pass to the method.
+	 * @type {Array<any>}
+	 */
+	args;
+
+	/**
+	 * Creates a new instance.
+	 * @param {Object} options The options for the step.
+	 * @param {string} options.target The target of the step.
+	 * @param {Array<any>} options.args The arguments of the step.
+	 */
+	constructor({ target, args }) {
+		this.target = target;
+		this.args = args;
+	}
+}
+
+/**
+ * A class to represent a directive comment.
+ * @implements {IDirective}
+ */
+class Directive {
+	/**
+	 * The type of directive.
+	 * @type {DirectiveType}
+	 * @readonly
+	 */
+	type;
+
+	/**
+	 * The node representing the directive.
+	 * @type {unknown}
+	 * @readonly
+	 */
+	node;
+
+	/**
+	 * Everything after the "eslint-disable" portion of the directive,
+	 * but before the "--" that indicates the justification.
+	 * @type {string}
+	 * @readonly
+	 */
+	value;
+
+	/**
+	 * The justification for the directive.
+	 * @type {string}
+	 * @readonly
+	 */
+	justification;
+
+	/**
+	 * Creates a new instance.
+	 * @param {Object} options The options for the directive.
+	 * @param {"disable"|"enable"|"disable-next-line"|"disable-line"} options.type The type of directive.
+	 * @param {unknown} options.node The node representing the directive.
+	 * @param {string} options.value The value of the directive.
+	 * @param {string} options.justification The justification for the directive.
+	 */
+	constructor({ type, node, value, justification }) {
+		this.type = type;
+		this.node = node;
+		this.value = value;
+		this.justification = justification;
+	}
+}
+
+/**
+ * Source Code Base Object
+ * @template {SourceCodeBaseTypeOptions & {RootNode: object, SyntaxElementWithLoc: object}} [Options=SourceCodeBaseTypeOptions & {RootNode: object, SyntaxElementWithLoc: object}]
+ * @implements {TextSourceCode<Options>}
+ */
+class TextSourceCodeBase {
+	/**
+	 * The lines of text in the source code.
+	 * @type {Array<string>}
+	 */
+	#lines = [];
+
+	/**
+	 * The indices of the start of each line in the source code.
+	 * @type {Array<number>}
+	 */
+	#lineStartIndices = [0];
+
+	/**
+	 * The pattern to match lineEndings in the source code.
+	 * @type {RegExp}
+	 */
+	#lineEndingPattern;
+
+	/**
+	 * The AST of the source code.
+	 * @type {Options['RootNode']}
+	 */
+	ast;
+
+	/**
+	 * The text of the source code.
+	 * @type {string}
+	 */
+	text;
+
+	/**
+	 * Creates a new instance.
+	 * @param {Object} options The options for the instance.
+	 * @param {string} options.text The source code text.
+	 * @param {Options['RootNode']} options.ast The root AST node.
+	 * @param {RegExp} [options.lineEndingPattern] The pattern to match lineEndings in the source code. Defaults to `/\r?\n/u`.
+	 */
+	constructor({ text, ast, lineEndingPattern = /\r?\n/u }) {
+		this.ast = ast;
+		this.text = text;
+		// Remove the global(`g`) and sticky(`y`) flags from the `lineEndingPattern` to avoid issues with lastIndex.
+		this.#lineEndingPattern = new RegExp(
+			lineEndingPattern.source,
+			lineEndingPattern.flags.replace(/[gy]/gu, ""),
+		);
+	}
+
+	/**
+	 * Finds the next line in the source text and updates `#lines` and `#lineStartIndices`.
+	 * @param {string} text The text to search for the next line.
+	 * @returns {boolean} `true` if a next line was found, `false` otherwise.
+	 */
+	#findNextLine(text) {
+		const match = this.#lineEndingPattern.exec(text);
+
+		if (!match) {
+			return false;
+		}
+
+		this.#lines.push(text.slice(0, match.index));
+		this.#lineStartIndices.push(
+			(this.#lineStartIndices.at(-1) ?? 0) +
+				match.index +
+				match[0].length,
+		);
+
+		return true;
+	}
+
+	/**
+	 * Ensures `#lines` is lazily calculated from the source text.
+	 * @returns {void}
+	 */
+	#ensureLines() {
+		// If `#lines` has already been calculated, do nothing.
+		if (this.#lines.length === this.#lineStartIndices.length) {
+			return;
+		}
+
+		while (
+			this.#findNextLine(this.text.slice(this.#lineStartIndices.at(-1)))
+		) {
+			// Continue parsing until no more matches are found.
+		}
+
+		this.#lines.push(this.text.slice(this.#lineStartIndices.at(-1)));
+
+		Object.freeze(this.#lines);
+	}
+
+	/**
+	 * Ensures `#lineStartIndices` is lazily calculated up to the specified index.
+	 * @param {number} index The index of a character in a file.
+	 * @returns {void}
+	 */
+	#ensureLineStartIndicesFromIndex(index) {
+		// If we've already parsed up to or beyond this index, do nothing.
+		if (index <= (this.#lineStartIndices.at(-1) ?? 0)) {
+			return;
+		}
+
+		while (
+			index > (this.#lineStartIndices.at(-1) ?? 0) &&
+			this.#findNextLine(this.text.slice(this.#lineStartIndices.at(-1)))
+		) {
+			// Continue parsing until no more matches are found.
+		}
+	}
+
+	/**
+	 * Ensures `#lineStartIndices` is lazily calculated up to the specified loc.
+	 * @param {Object} loc A line/column location.
+	 * @param {number} loc.line The line number of the location. (0 or 1-indexed based on language.)
+	 * @param {number} lineStart The line number at which the parser starts counting.
+	 * @returns {void}
+	 */
+	#ensureLineStartIndicesFromLoc(loc, lineStart) {
+		// Calculate line indices up to the potentially next line, as it is needed for the follow‑up calculation.
+		const nextLocLineIndex = loc.line - lineStart + 1;
+		const lastCalculatedLineIndex = this.#lineStartIndices.length - 1;
+		let additionalLinesNeeded = nextLocLineIndex - lastCalculatedLineIndex;
+
+		// If we've already parsed up to or beyond this line, do nothing.
+		if (additionalLinesNeeded <= 0) {
+			return;
+		}
+
+		while (
+			additionalLinesNeeded > 0 &&
+			this.#findNextLine(this.text.slice(this.#lineStartIndices.at(-1)))
+		) {
+			// Continue parsing until no more matches are found or we have enough lines.
+			additionalLinesNeeded -= 1;
+		}
+	}
+
+	/**
+	 * Returns the loc information for the given node or token.
+	 * @param {Options['SyntaxElementWithLoc']} nodeOrToken The node or token to get the loc information for.
+	 * @returns {SourceLocation} The loc information for the node or token.
+	 * @throws {Error} If the node or token does not have loc information.
+	 */
+	getLoc(nodeOrToken) {
+		if (hasESTreeStyleLoc(nodeOrToken)) {
+			return nodeOrToken.loc;
+		}
+
+		if (hasPosStyleLoc(nodeOrToken)) {
+			return nodeOrToken.position;
+		}
+
+		throw new Error(
+			"Custom getLoc() method must be implemented in the subclass.",
+		);
+	}
+
+	/**
+	 * Converts a source text index into a `{ line: number, column: number }` pair.
+	 * @param {number} index The index of a character in a file.
+	 * @throws {TypeError|RangeError} If non-numeric index or index out of range.
+	 * @returns {{line: number, column: number}} A `{ line: number, column: number }` location object with 0 or 1-indexed line and 0 or 1-indexed column based on language.
+	 * @public
+	 */
+	getLocFromIndex(index) {
+		if (typeof index !== "number") {
+			throw new TypeError("Expected `index` to be a number.");
+		}
+
+		if (index < 0 || index > this.text.length) {
+			throw new RangeError(
+				`Index out of range (requested index ${index}, but source text has length ${this.text.length}).`,
+			);
+		}
+
+		const {
+			start: { line: lineStart, column: columnStart },
+			end: { line: lineEnd, column: columnEnd },
+		} = this.getLoc(this.ast);
+
+		// If the index is at the start, return the start location of the root node.
+		if (index === 0) {
+			return {
+				line: lineStart,
+				column: columnStart,
+			};
+		}
+
+		// If the index is `this.text.length`, return the location one "spot" past the last character of the file.
+		if (index === this.text.length) {
+			return {
+				line: lineEnd,
+				column: columnEnd,
+			};
+		}
+
+		// Ensure `#lineStartIndices` are lazily calculated.
+		this.#ensureLineStartIndicesFromIndex(index);
+
+		/*
+		 * To figure out which line `index` is on, determine the last place at which index could
+		 * be inserted into `#lineStartIndices` to keep the list sorted.
+		 */
+		const lineNumber =
+			(index >= (this.#lineStartIndices.at(-1) ?? 0)
+				? this.#lineStartIndices.length
+				: findLineNumberBinarySearch(this.#lineStartIndices, index)) -
+			1 +
+			lineStart;
+
+		return {
+			line: lineNumber,
+			column:
+				index -
+				this.#lineStartIndices[lineNumber - lineStart] +
+				columnStart,
+		};
+	}
+
+	/**
+	 * Converts a `{ line: number, column: number }` pair into a source text index.
+	 * @param {Object} loc A line/column location.
+	 * @param {number} loc.line The line number of the location. (0 or 1-indexed based on language.)
+	 * @param {number} loc.column The column number of the location. (0 or 1-indexed based on language.)
+	 * @throws {TypeError|RangeError} If `loc` is not an object with a numeric
+	 * `line` and `column`, if the `line` is less than or equal to zero or
+	 * the `line` or `column` is out of the expected range.
+	 * @returns {number} The index of the line/column location in a file.
+	 * @public
+	 */
+	getIndexFromLoc(loc) {
+		if (
+			loc === null ||
+			typeof loc !== "object" ||
+			typeof loc.line !== "number" ||
+			typeof loc.column !== "number"
+		) {
+			throw new TypeError(
+				"Expected `loc` to be an object with numeric `line` and `column` properties.",
+			);
+		}
+
+		const {
+			start: { line: lineStart, column: columnStart },
+			end: { line: lineEnd, column: columnEnd },
+		} = this.getLoc(this.ast);
+
+		if (loc.line < lineStart || lineEnd < loc.line) {
+			throw new RangeError(
+				`Line number out of range (line ${loc.line} requested). Valid range: ${lineStart}-${lineEnd}`,
+			);
+		}
+
+		// If the loc is at the start, return the start index of the root node.
+		if (loc.line === lineStart && loc.column === columnStart) {
+			return 0;
+		}
+
+		// If the loc is at the end, return the index one "spot" past the last character of the file.
+		if (loc.line === lineEnd && loc.column === columnEnd) {
+			return this.text.length;
+		}
+
+		// Ensure `#lineStartIndices` are lazily calculated.
+		this.#ensureLineStartIndicesFromLoc(loc, lineStart);
+
+		const isLastLine = loc.line === lineEnd;
+		const lineStartIndex = this.#lineStartIndices[loc.line - lineStart];
+		const lineEndIndex = isLastLine
+			? this.text.length
+			: this.#lineStartIndices[loc.line - lineStart + 1];
+		const positionIndex = lineStartIndex + loc.column - columnStart;
+
+		if (
+			loc.column < columnStart ||
+			(isLastLine && positionIndex > lineEndIndex) ||
+			(!isLastLine && positionIndex >= lineEndIndex)
+		) {
+			throw new RangeError(
+				`Column number out of range (column ${loc.column} requested). Valid range for line ${loc.line}: ${columnStart}-${lineEndIndex - lineStartIndex + columnStart + (isLastLine ? 0 : -1)}`,
+			);
+		}
+
+		return positionIndex;
+	}
+
+	/**
+	 * Returns the range information for the given node or token.
+	 * @param {Options['SyntaxElementWithLoc']} nodeOrToken The node or token to get the range information for.
+	 * @returns {SourceRange} The range information for the node or token.
+	 * @throws {Error} If the node or token does not have range information.
+	 */
+	getRange(nodeOrToken) {
+		if (hasESTreeStyleRange(nodeOrToken)) {
+			return nodeOrToken.range;
+		}
+
+		if (hasPosStyleRange(nodeOrToken)) {
+			return [
+				nodeOrToken.position.start.offset,
+				nodeOrToken.position.end.offset,
+			];
+		}
+
+		throw new Error(
+			"Custom getRange() method must be implemented in the subclass.",
+		);
+	}
+
+	/* eslint-disable no-unused-vars -- Required to complete interface. */
+	/**
+	 * Returns the parent of the given node.
+	 * @param {Options['SyntaxElementWithLoc']} node The node to get the parent of.
+	 * @returns {Options['SyntaxElementWithLoc']|undefined} The parent of the node.
+	 * @throws {Error} If the method is not implemented in the subclass.
+	 */
+	getParent(node) {
+		throw new Error("Not implemented.");
+	}
+	/* eslint-enable no-unused-vars -- Required to complete interface. */
+
+	/**
+	 * Gets all the ancestors of a given node
+	 * @param {Options['SyntaxElementWithLoc']} node The node
+	 * @returns {Array<Options['SyntaxElementWithLoc']>} All the ancestor nodes in the AST, not including the provided node, starting
+	 * from the root node at index 0 and going inwards to the parent node.
+	 * @throws {TypeError} When `node` is missing.
+	 */
+	getAncestors(node) {
+		if (!node) {
+			throw new TypeError("Missing required argument: node.");
+		}
+
+		const ancestorsStartingAtParent = [];
+
+		for (
+			let ancestor = this.getParent(node);
+			ancestor;
+			ancestor = this.getParent(ancestor)
+		) {
+			ancestorsStartingAtParent.push(ancestor);
+		}
+
+		return ancestorsStartingAtParent.reverse();
+	}
+
+	/**
+	 * Gets the source code for the given node.
+	 * @param {Options['SyntaxElementWithLoc']} [node] The AST node to get the text for.
+	 * @param {number} [beforeCount] The number of characters before the node to retrieve.
+	 * @param {number} [afterCount] The number of characters after the node to retrieve.
+	 * @returns {string} The text representing the AST node.
+	 * @public
+	 */
+	getText(node, beforeCount, afterCount) {
+		if (node) {
+			const range = this.getRange(node);
+			return this.text.slice(
+				Math.max(range[0] - (beforeCount || 0), 0),
+				range[1] + (afterCount || 0),
+			);
+		}
+		return this.text;
+	}
+
+	/**
+	 * Gets the entire source text split into an array of lines.
+	 * @returns {Array<string>} The source text as an array of lines.
+	 * @public
+	 */
+	get lines() {
+		this.#ensureLines(); // Ensure `#lines` is lazily calculated.
+
+		return this.#lines;
+	}
+
+	/**
+	 * Traverse the source code and return the steps that were taken.
+	 * @returns {Iterable<TraversalStep>} The steps that were taken while traversing the source code.
+	 */
+	traverse() {
+		throw new Error("Not implemented.");
+	}
+}
+
+export { CallMethodStep, ConfigCommentParser, Directive, TextSourceCodeBase, VisitNodeStep };
