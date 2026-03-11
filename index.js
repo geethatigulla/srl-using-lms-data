@@ -3,59 +3,147 @@
 Object.defineProperty(exports, "__esModule", {
   value: true
 });
-exports.default = void 0;
-var _helperPluginUtils = require("@babel/helper-plugin-utils");
-var _core = require("@babel/core");
-const TRACE_ID = "__self";
-function getThisFunctionParent(path) {
-  let scope = path.scope;
-  do {
-    const {
-      path
-    } = scope;
-    if (path.isFunctionParent() && !path.isArrowFunctionExpression()) {
-      return path;
-    }
-  } while (scope = scope.parent);
-  return null;
-}
-function isDerivedClass(classPath) {
-  return classPath.node.superClass !== null;
-}
-function isThisAllowed(path) {
-  const parentMethodOrFunction = getThisFunctionParent(path);
-  if (parentMethodOrFunction === null) {
-    return true;
+exports._getTypeAnnotation = _getTypeAnnotation;
+exports.baseTypeStrictlyMatches = baseTypeStrictlyMatches;
+exports.couldBeBaseType = couldBeBaseType;
+exports.getTypeAnnotation = getTypeAnnotation;
+exports.isBaseType = isBaseType;
+exports.isGenericType = isGenericType;
+var inferers = require("./inferers.js");
+var _t = require("@babel/types");
+const {
+  anyTypeAnnotation,
+  isAnyTypeAnnotation,
+  isArrayTypeAnnotation,
+  isBooleanTypeAnnotation,
+  isEmptyTypeAnnotation,
+  isFlowBaseAnnotation,
+  isGenericTypeAnnotation,
+  isIdentifier,
+  isMixedTypeAnnotation,
+  isNumberTypeAnnotation,
+  isStringTypeAnnotation,
+  isTSArrayType,
+  isTSTypeAnnotation,
+  isTSTypeReference,
+  isTupleTypeAnnotation,
+  isTypeAnnotation,
+  isUnionTypeAnnotation,
+  isVoidTypeAnnotation,
+  stringTypeAnnotation,
+  voidTypeAnnotation
+} = _t;
+function getTypeAnnotation() {
+  let type = this.getData("typeAnnotation");
+  if (type != null) {
+    return type;
   }
-  if (!parentMethodOrFunction.isMethod()) {
-    return true;
+  type = _getTypeAnnotation.call(this) || anyTypeAnnotation();
+  if (isTypeAnnotation(type) || isTSTypeAnnotation(type)) {
+    type = type.typeAnnotation;
   }
-  if (parentMethodOrFunction.node.kind !== "constructor") {
-    return true;
-  }
-  return !isDerivedClass(parentMethodOrFunction.parentPath.parentPath);
+  this.setData("typeAnnotation", type);
+  return type;
 }
-var _default = exports.default = (0, _helperPluginUtils.declare)(api => {
-  api.assertVersion(7);
-  const visitor = {
-    JSXOpeningElement(path) {
-      if (!isThisAllowed(path)) {
-        return;
+const typeAnnotationInferringNodes = new WeakSet();
+function _getTypeAnnotation() {
+  const node = this.node;
+  if (!node) {
+    if (this.key === "init" && this.parentPath.isVariableDeclarator()) {
+      const declar = this.parentPath.parentPath;
+      const declarParent = declar.parentPath;
+      if (declar.key === "left" && declarParent.isForInStatement()) {
+        return stringTypeAnnotation();
       }
-      const node = path.node;
-      const id = _core.types.jsxIdentifier(TRACE_ID);
-      const trace = _core.types.thisExpression();
-      node.attributes.push(_core.types.jsxAttribute(id, _core.types.jsxExpressionContainer(trace)));
+      if (declar.key === "left" && declarParent.isForOfStatement()) {
+        return anyTypeAnnotation();
+      }
+      return voidTypeAnnotation();
+    } else {
+      return;
     }
-  };
-  return {
-    name: "transform-react-jsx-self",
-    visitor: {
-      Program(path) {
-        path.traverse(visitor);
+  }
+  if (node.typeAnnotation) {
+    return node.typeAnnotation;
+  }
+  if (typeAnnotationInferringNodes.has(node)) {
+    return;
+  }
+  typeAnnotationInferringNodes.add(node);
+  try {
+    var _inferer;
+    let inferer = inferers[node.type];
+    if (inferer) {
+      return inferer.call(this, node);
+    }
+    inferer = inferers[this.parentPath.type];
+    if ((_inferer = inferer) != null && _inferer.validParent) {
+      return this.parentPath.getTypeAnnotation();
+    }
+  } finally {
+    typeAnnotationInferringNodes.delete(node);
+  }
+}
+function isBaseType(baseName, soft) {
+  return _isBaseType(baseName, this.getTypeAnnotation(), soft);
+}
+function _isBaseType(baseName, type, soft) {
+  if (baseName === "string") {
+    return isStringTypeAnnotation(type);
+  } else if (baseName === "number") {
+    return isNumberTypeAnnotation(type);
+  } else if (baseName === "boolean") {
+    return isBooleanTypeAnnotation(type);
+  } else if (baseName === "any") {
+    return isAnyTypeAnnotation(type);
+  } else if (baseName === "mixed") {
+    return isMixedTypeAnnotation(type);
+  } else if (baseName === "empty") {
+    return isEmptyTypeAnnotation(type);
+  } else if (baseName === "void") {
+    return isVoidTypeAnnotation(type);
+  } else {
+    if (soft) {
+      return false;
+    } else {
+      throw new Error(`Unknown base type ${baseName}`);
+    }
+  }
+}
+function couldBeBaseType(name) {
+  const type = this.getTypeAnnotation();
+  if (isAnyTypeAnnotation(type)) return true;
+  if (isUnionTypeAnnotation(type)) {
+    for (const type2 of type.types) {
+      if (isAnyTypeAnnotation(type2) || _isBaseType(name, type2, true)) {
+        return true;
       }
     }
-  };
-});
+    return false;
+  } else {
+    return _isBaseType(name, type, true);
+  }
+}
+function baseTypeStrictlyMatches(rightArg) {
+  const left = this.getTypeAnnotation();
+  const right = rightArg.getTypeAnnotation();
+  if (!isAnyTypeAnnotation(left) && isFlowBaseAnnotation(left)) {
+    return right.type === left.type;
+  }
+  return false;
+}
+function isGenericType(genericName) {
+  const type = this.getTypeAnnotation();
+  if (genericName === "Array") {
+    if (isTSArrayType(type) || isArrayTypeAnnotation(type) || isTupleTypeAnnotation(type)) {
+      return true;
+    }
+  }
+  return isGenericTypeAnnotation(type) && isIdentifier(type.id, {
+    name: genericName
+  }) || isTSTypeReference(type) && isIdentifier(type.typeName, {
+    name: genericName
+  });
+}
 
 //# sourceMappingURL=index.js.map
